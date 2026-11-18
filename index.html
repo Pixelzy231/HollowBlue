@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HydroSense AI</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:#EDF2F3; --panel:#FFFFFF; --ink:#0E2A33; --muted:#5B7078; --line:#D3DEE1;
+    --nile:#0B6E8A; --ok:#2C8A5B; --warn:#C98200; --bad:#C42D2D;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:#0B1A20; --panel:#12262E; --ink:#E6F0F2; --muted:#8FA6AE; --line:#24404A;
+      --nile:#4FB6D3; --ok:#4CC38A; --warn:#E5A93A; --bad:#F06A6A;
+    }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:400 15px/1.5 "IBM Plex Sans", system-ui, sans-serif; }
+  header { display:flex; justify-content:space-between; align-items:baseline; gap:12px;
+           padding:18px 24px 6px; flex-wrap:wrap; }
+  h1 { margin:0; font-size:26px; font-weight:700; letter-spacing:-.01em; }
+  header p { margin:0; color:var(--muted); }
+  #live { color:var(--muted); font-size:13px; }
+  main { display:grid; grid-template-columns:minmax(0,3fr) minmax(0,2fr); gap:16px; padding:16px 24px 28px; }
+  @media (max-width:900px){ main{ grid-template-columns:1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:16px; }
+  #map { height:460px; border-radius:4px; }
+  .kpis { display:grid; grid-template-columns:repeat(2,1fr); gap:12px; margin-bottom:16px; }
+  .kpi b { display:block; font-size:30px; line-height:1.1; font-weight:700; }
+  .kpi span { color:var(--muted); font-size:13px; }
+  h2 { font-size:15px; margin:0 0 10px; font-weight:600; }
+  .chart-box { height:220px; position:relative; }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  th,td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:600; }
+  .tag { padding:2px 8px; border-radius:10px; font-size:12px; font-weight:600; color:#fff; }
+  .low{background:var(--ok)} .medium{background:var(--warn)} .high{background:var(--bad)}
+  .leak { color:var(--bad); font-weight:600; }
+  .wide { grid-column:1 / -1; overflow-x:auto; }
+  #err { display:none; margin:0 24px; padding:10px 14px; border-radius:6px;
+         background:var(--bad); color:#fff; }
+  :focus-visible { outline:2px solid var(--nile); outline-offset:2px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>HydroSense AI</h1>
+    <p>Irrigation and leak monitoring for the Toshka demo area</p>
+  </div>
+  <div id="live">Connecting…</div>
+</header>
+<div id="err" role="alert">Can't reach the HydroSense API. Start it with <code>python app.py</code> in the backend folder.</div>
+
+<main>
+  <section class="panel" aria-label="Zone map">
+    <h2>Zone status</h2>
+    <div id="map"></div>
+  </section>
+
+  <section aria-label="Key figures">
+    <div class="kpis">
+      <div class="panel kpi"><b id="k-pct">–</b><span>Water saved vs fixed schedule</span></div>
+      <div class="panel kpi"><b id="k-m3">–</b><span>m³ saved per day</span></div>
+      <div class="panel kpi"><b id="k-leaks">–</b><span>Suspected leaks</span></div>
+      <div class="panel kpi"><b id="k-stress">–</b><span>Zones with high water stress</span></div>
+    </div>
+    <div class="panel">
+      <h2>Water use per day (m³): AI recommendation vs fixed schedule</h2>
+      <div class="chart-box"><canvas id="chart"></canvas></div>
+    </div>
+  </section>
+
+  <section class="panel wide" aria-label="Zone details">
+    <h2>Zone details</h2>
+    <table>
+      <thead><tr><th>Zone</th><th>Soil moisture</th><th>Temp</th><th>Pressure</th>
+        <th>AI irrigation (mm/day)</th><th>Water stress</th><th>Network</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </section>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script>
+const COLORS = { low:"#2C8A5B", medium:"#C98200", high:"#C42D2D" };
+const map = L.map("map").setView([22.78, 31.6], 9);
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+  { maxZoom:18, attribution:"© OpenStreetMap contributors" }).addTo(map);
+const markers = [];
+
+const chart = new Chart(document.getElementById("chart"), {
+  type:"line",
+  data:{ labels:[], datasets:[
+    { label:"AI recommendation", data:[], borderColor:"#0B6E8A", backgroundColor:"#0B6E8A", tension:.3 },
+    { label:"Fixed schedule", data:[], borderColor:"#8A8F94", backgroundColor:"#8A8F94", borderDash:[6,4], tension:.3 }
+  ]},
+  options:{ responsive:true, maintainAspectRatio:false, animation:false,
+            scales:{ x:{ display:false } }, plugins:{ legend:{ position:"bottom" } } }
+});
+
+async function refresh() {
+  try {
+    const res = await fetch("/api/status");
+    if (!res.ok) throw new Error(res.status);
+    const d = await res.json();
+    document.getElementById("err").style.display = "none";
+    document.getElementById("live").textContent = "Live · updated " + new Date().toLocaleTimeString();
+
+    document.getElementById("k-pct").textContent = d.kpi.saved_pct + "%";
+    document.getElementById("k-m3").textContent = d.kpi.saved_m3.toLocaleString();
+    document.getElementById("k-leaks").textContent = d.kpi.leaks;
+    document.getElementById("k-stress").textContent = d.kpi.high_stress;
+
+    markers.forEach(m => m.remove()); markers.length = 0;
+    d.zones.forEach(z => {
+      const m = L.circleMarker([z.lat, z.lon], {
+        radius: 10 + z.ha / 60, color: z.leak ? "#C42D2D" : "#0E2A33",
+        weight: z.leak ? 4 : 1, fillColor: COLORS[z.stress], fillOpacity: .8
+      }).addTo(map).bindPopup(
+        `<b>${z.name}</b><br>Stress: ${z.stress}<br>Moisture: ${z.moisture}%<br>` +
+        `AI irrigation: ${z.need_mm} mm/day<br>${z.leak ? "Suspected leak" : "Network normal"}`);
+      markers.push(m);
+    });
+
+    document.getElementById("rows").innerHTML = d.zones.map(z => `
+      <tr><td>${z.name}</td><td>${z.moisture}%</td><td>${z.temp}°C</td><td>${z.pressure} bar</td>
+      <td>${z.need_mm}</td><td><span class="tag ${z.stress}">${z.stress}</span></td>
+      <td>${z.leak ? '<span class="leak">Suspected leak</span>' : "Normal"}</td></tr>`).join("");
+
+    chart.data.labels = d.history.map((_, i) => i);
+    chart.data.datasets[0].data = d.history.map(h => h.recommended);
+    chart.data.datasets[1].data = d.history.map(h => h.routine);
+    chart.update();
+  } catch (e) {
+    document.getElementById("err").style.display = "block";
+    document.getElementById("live").textContent = "Offline";
+  }
+}
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
